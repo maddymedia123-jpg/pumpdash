@@ -1,83 +1,63 @@
+import ccxt
+import pandas as pd
+import derivs
+import onchain
+import htf
 import json
 import time
 
-import ccxt
-import pandas as pd
-
-import derivs
-import htf
-import net
-import onchain
-
-_ex = ccxt.binance({"enableRateLimit": True})
-COLS = ["ts", "open", "high", "low", "close", "volume"]
-
-
-def ohlcv(symbol, tf="4h", limit=300):
-    df = pd.DataFrame(_ex.fetch_ohlcv(symbol, tf, limit=limit), columns=COLS)
-    return df.iloc[:-1].reset_index(drop=True)  # drop the still-forming candle
-
-
-def history(symbol, tf="1h", days=120):
-    """Paginated candles (ts in ms), closed candles only."""
-    step = _ex.parse_timeframe(tf) * 1000
-    since, rows = _ex.milliseconds() - days * 86_400_000, []
-    while True:
-        b = _ex.fetch_ohlcv(symbol, tf, since=since, limit=1000)
-        if not b:
-            break
-        rows += b
-        since = b[-1][0] + step
-        if len(b) < 1000:
-            break
-    df = pd.DataFrame(rows, columns=COLS).drop_duplicates("ts")
-    return df.iloc[:-1].reset_index(drop=True)
-
-
-def dex_stats(query):
-    """Ticker search is NOT safe (clone tokens share tickers) - pass chain+pair to build_packet to override."""
-    pairs = net.get_json("https://api.dexscreener.com/latest/dex/search", {"q": query}).get("pairs") or []
-    if not pairs:
-        return {}
-    p = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd", 0))
-    return {"dex_chain": p.get("chainId"), "dex_pair": p.get("pairAddress"),
-            "dex_price": float(p.get("priceUsd") or 0),
-            "dex_liq_usd": (p.get("liquidity") or {}).get("usd", 0),
-            "dex_vol_1h": (p.get("volume") or {}).get("h1", 0),
-            "dex_vol_24h": (p.get("volume") or {}).get("h24", 0),
-            "dex_chg_1h": (p.get("priceChange") or {}).get("h1", 0)}
-
+def fetch_ohlcv_multi(symbol, timeframe="1h", limit=100):
+    """Attempts to fetch candle data across multiple global exchanges."""
+    exchanges = [
+        ccxt.bybit({'enableRateLimit': True}),
+        ccxt.kucoin({'enableRateLimit': True}),
+        ccxt.gateio({'enableRateLimit': True}),
+        ccxt.binance({'enableRateLimit': True})
+    ]
+    for ex in exchanges:
+        try:
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if ohlcv and len(ohlcv) > 0:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 def build_packet(symbol, chain=None, pair=None):
-    pk = {"symbol": symbol}
-    pk.update(htf.report({tf: ohlcv(symbol, tf) for tf in ("1d", "4h")}))  # required: errors propagate
-    try:
-        pk.update(dex_stats(symbol.split("/")[0]))
-    except Exception:
-        pk["dex_ok"] = False
-    if chain and pair:
-        pk.update({"dex_chain": chain, "dex_pair": pair})
-    pk.update(derivs.stats(symbol))  # optional feeds degrade to *_ok/has_perp flags instead of crashing
-    pk.update(onchain.flow(pk.get("dex_chain"), pk.get("dex_pair")))
-    return pk
-
-
-def universe(categories_csv):
-    """categories_csv: symbol,category (your own narrative map)."""
-    cats = pd.read_csv(categories_csv)
-    tick = _ex.fetch_tickers(list(cats.symbol))
-    rows = []
-    for _, r in cats.iterrows():
-        t = tick.get(r.symbol)
-        if not t:
-            continue
-        d = ohlcv(r.symbol, "1d", 10)
-        base = (d.volume * d.close).iloc[-8:].median()
-        rows.append({"symbol": r.symbol, "category": r.category, "chg_24h": (t["percentage"] or 0) / 100,
-                     "vol_24h": t["quoteVolume"] or 0, "rel_vol": (t["quoteVolume"] or 0) / (base + 1e-9)})
-    return pd.DataFrame(rows)
-
+    """Builds an integrated analysis packet for a given symbol."""
+    df_4h = fetch_ohlcv_multi(symbol, "4h", 100)
+    df_1d = fetch_ohlcv_multi(symbol, "1d", 100)
+    
+    htf_res = htf.analyze(df_4h, df_1d) if not df_4h.empty else {}
+    der_res = derivs.analyze(symbol)
+    chain_res = onchain.analyze(symbol, chain, pair) if hasattr(onchain, 'analyze') else {}
+    
+    packet = {
+        "symbol": symbol,
+        "timestamp": int(time.time()),
+        "4h_atr_pct": htf_res.get("atr_pct", 0.05),
+        "htf_score": htf_res.get("htf_score", 50),
+        "htf_aligned": htf_res.get("htf_aligned", False),
+        "htf_late": htf_res.get("htf_late", False),
+        "deriv_regime": der_res.get("deriv_regime", "neutral"),
+        "deriv_funding": der_res.get("deriv_funding", 0.0),
+        "chain_imbalance": chain_res.get("imbalance", 0.0),
+        "chain_wash_share": chain_res.get("wash_share", 0.0),
+        "dex_liq_usd": chain_res.get("dex_liq_usd", 100000.0)
+    }
+    return packet
 
 def log_signal(packet, verdict, path="signals.jsonl"):
-    with open(path, "a") as f:
-        f.write(json.dumps({"t": time.time(), "packet": packet, "verdict": verdict}, default=str) + "\n")
+    try:
+        record = {"t": int(time.time()), "packet": packet, "verdict": verdict}
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+def universe(cats_file="categories.csv"):
+    if not pd.io.common.file_exists(cats_file):
+        return []
+    df = pd.read_csv(cats_file)
+    return df.to_dict("records")
