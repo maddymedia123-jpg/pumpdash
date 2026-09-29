@@ -1,3 +1,4 @@
+import os
 import ccxt
 import pandas as pd
 import derivs
@@ -57,7 +58,6 @@ def log_signal(packet, verdict, path="signals.jsonl"):
         pass
 
 def universe(cats_file="categories.csv"):
-    if not pd.io.common.file_exists(cats_file):
-        return []
-    df = pd.read_csv(cats_file)
-    return df.to_dict("records")
+    if not os.path.exists(cats_file):
+        return pd.DataFrame()
+    return pd.read_csv(cats_file)
