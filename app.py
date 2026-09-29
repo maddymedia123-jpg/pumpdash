@@ -14,12 +14,10 @@ st.title("Pump Desk")
 st.caption("Automated Crypto Research & Market Scanner Desk")
 
 CATS, EV = "categories.csv", "events.csv"
+data.ensure_categories_file(CATS)
 
-if os.path.exists(CATS):
-    _c = pd.read_csv(CATS)
-    cat_of = dict(zip(_c.symbol, _c.category))
-else:
-    cat_of = {}
+_c = pd.read_csv(CATS)
+cat_of = dict(zip(_c.symbol, _c.category))
 
 sb = st.sidebar
 sb.header("Scanner Configuration")
@@ -35,7 +33,7 @@ selected_tf_label = sb.selectbox("Scanning Timeframe", list(tf_map.keys()), inde
 selected_tf = tf_map[selected_tf_label]
 
 if scan_mode == "Custom Watchlist":
-    default_watch = "\n".join(_c.symbol.tolist()) if cat_of else "SOL/USDT\nTAO/USDT\nFET/USDT\nPEPE/USDT\nWIF/USDT"
+    default_watch = "\n".join(_c.symbol.tolist()) if cat_of else "SOL/USDT\nTAO/USDT\nFET/USDT\nPEPE/USDT"
     watch = [s.strip() for s in sb.text_area("Watchlist (one per line)", default_watch, height=180).splitlines() if s.strip()]
 else:
     watch = []
@@ -45,11 +43,11 @@ use_llm = sb.toggle("Run agent debate on top picks", value=bool(os.getenv("ANTHR
 top_n = sb.slider("Top N sent to agents", 1, 5, 2)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def followers_now():
-    if not cat_of:
+    try:
+        return set(rotation.find_followers(data.universe(CATS)).get("symbol", []))
+    except Exception:
         return set()
-    return set(rotation.find_followers(data.universe(CATS)).get("symbol", []))
 
 
 def render_verdict(pk, reports, v):
@@ -76,7 +74,7 @@ def run_agents(pk):
 def execute_scan():
     symbols_to_scan = watch
     if scan_mode == "Auto-Discover Market (Top 50 Volume)":
-        with st.spinner("Fetching top 50 high-volume market pairs dynamically from global exchanges..."):
+        with st.spinner("Fetching top market pairs dynamically from global exchanges..."):
             symbols_to_scan = data.fetch_top_market_pairs(limit=50)
 
     st.info(f"Scanning {len(symbols_to_scan)} coins on {selected_tf_label} ({selected_tf}) timeframe...")
@@ -88,21 +86,20 @@ def execute_scan():
         if "error" in p:
             st.warning(f"{p['symbol']}: {p['error']}")
 
-    ok = sorted((p for p in pks if "error" not in p), key=lambda p: p["scan_score"], reverse=True)
+    ok = sorted((p for p in pks if "error" not in p), key=lambda p: p.get("scan_score", 0), reverse=True)
     cols = ["symbol", "scan_score", "htf_score", "htf_aligned", "htf_late", "deriv_regime", "deriv_funding",
             "chain_imbalance", "chain_wash_share", "dex_liq_usd"]
 
     if ok:
         st.subheader(f"Top Potential Opportunities ({selected_tf_label})")
         st.dataframe(pd.DataFrame(ok).reindex(columns=cols), use_container_width=True)
+        for p in ok:
+            data.log_signal(p, {"verdict": "scan"})
     else:
         st.warning("No valid coins found during scan.")
 
-    for p in ok:
-        data.log_signal(p, {"verdict": "scan"})
-
     if use_llm:
-        for p in [p for p in ok if p["scan_score"] > 0][:top_n]:
+        for p in [p for p in ok if p.get("scan_score", 0) > 0][:top_n]:
             rep, v = run_agents(p)
             if rep:
                 data.log_signal(p, v)
@@ -142,39 +139,52 @@ with t_dive:
             if rep:
                 render_verdict(pk, rep, v)
         ev = pd.read_csv(EV) if os.path.exists(EV) else pd.DataFrame()
-        if len(ev) and cat_of.get(sym) in set(ev.category):
+        if len(ev) and cat_of.get(sym) in set(ev.category if 'category' in ev else []):
             ev = ev[ev.category == cat_of[sym]]
         lv = rotation.tp_sl(ev.to_dict("records") if len(ev) else [], lead, pk["4h_atr_pct"])
-        st.subheader("TP / SL (% from entry)")
+        st.subheader("TP / SL Targets")
         st.json(lv)
         data.log_signal(pk, v)
 
 with t_rot:
-    if cat_of and st.button("Scan rotation"):
-        try:
-            f = rotation.find_followers(data.universe(CATS))
-            st.dataframe(f if len(f) else pd.DataFrame({"result": ["no leader/follower pairs right now"]}))
-        except Exception as e:
-            st.error(f"Rotation scan failed: {e}")
+    st.subheader("Sector Lead/Lag Rotation Scanner")
+    if st.button("🔍 Run Rotation Scan"):
+        with st.spinner("Scanning category leaders and followers..."):
+            try:
+                f = rotation.find_followers(data.universe(CATS))
+                if len(f):
+                    st.dataframe(f, use_container_width=True)
+                else:
+                    st.info("No active sector lag/follower opportunities found at this moment.")
+            except Exception as e:
+                st.error(f"Rotation scan failed: {e}")
+    else:
+        st.info("Click 'Run Rotation Scan' to scan category leaders and lagging follower coins.")
 
 with t_bt:
-    days = st.slider("History (days)", 30, 180, 120)
-    if cat_of and st.button("Build event history (slow)"):
-        with st.spinner("Downloading history and extracting events..."):
+    st.subheader("Sector Rotation Backtester")
+    days = st.slider("History Window (Days)", 30, 180, 60)
+    if st.button("⚙️ Build / Update Backtest History"):
+        with st.spinner("Building category rotation event history..."):
             built = events.build(CATS, days)
             built.to_csv(EV, index=False)
+            st.success("Backtest event database updated!")
+            
+    if not os.path.exists(EV):
+        built = events.build(CATS, 60)
+        built.to_csv(EV, index=False)
+
     if os.path.exists(EV):
         ev = pd.read_csv(EV)
         if len(ev):
             st.dataframe(events.edge(ev), use_container_width=True)
-            st.dataframe(ev.tail(200), use_container_width=True)
+            st.dataframe(ev, use_container_width=True)
 
 with t_trk:
-    if st.button("Evaluate matured signals (72h+ old)"):
-        with st.spinner("Scoring logged signals..."):
-            res = tracker.evaluate()
-        if res.empty:
-            st.info("No matured signals yet.")
-        else:
-            st.dataframe(tracker.summary(res), use_container_width=True)
-            st.dataframe(res, use_container_width=True)
+    st.subheader("Signal Performance Tracker")
+    res = tracker.evaluate()
+    if res.empty:
+        st.info("No signals logged yet. Run a market scan to log opportunities into the tracker!")
+    else:
+        st.dataframe(tracker.summary(res), use_container_width=True)
+        st.dataframe(res, use_container_width=True)

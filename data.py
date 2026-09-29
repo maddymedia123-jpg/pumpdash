@@ -7,8 +7,21 @@ import htf
 import json
 import time
 
+DEFAULT_CATEGORIES = {
+    "SOL/USDT": "L1", "BTC/USDT": "Major", "ETH/USDT": "Major", "BNB/USDT": "L1",
+    "XRP/USDT": "Major", "ADA/USDT": "L1", "AVAX/USDT": "L1", "SUI/USDT": "L1",
+    "NEAR/USDT": "AI", "TAO/USDT": "AI", "FET/USDT": "AI", "RENDER/USDT": "AI",
+    "PEPE/USDT": "Meme", "WIF/USDT": "Meme", "DOGE/USDT": "Meme", "SHIB/USDT": "Meme",
+    "FLOKI/USDT": "Meme", "BONK/USDT": "Meme", "PUMP/USDT": "Meme", "QNT/USDT": "Infra",
+    "LINK/USDT": "Infra", "UNI/USDT": "DeFi", "AAVE/USDT": "DeFi"
+}
+
+def ensure_categories_file(cats_file="categories.csv"):
+    if not os.path.exists(cats_file):
+        df = pd.DataFrame([{"symbol": k, "category": v} for k, v in DEFAULT_CATEGORIES.items()])
+        df.to_csv(cats_file, index=False)
+
 def get_active_exchanges():
-    """Initializes reliable global exchanges using correct CCXT class names."""
     exchanges = []
     for ex_cls in [ccxt.bybit, ccxt.kucoin, ccxt.gate, ccxt.mexc]:
         try:
@@ -18,7 +31,6 @@ def get_active_exchanges():
     return exchanges
 
 def fetch_top_market_pairs(limit=50):
-    """Dynamically fetches top volume USDT pairs across active exchanges."""
     pairs = set()
     for ex in get_active_exchanges():
         try:
@@ -35,10 +47,9 @@ def fetch_top_market_pairs(limit=50):
                 break
         except Exception:
             continue
-    return list(pairs)[:limit] if pairs else ["SOL/USDT", "BTC/USDT", "ETH/USDT", "TAO/USDT", "PEPE/USDT"]
+    return list(pairs)[:limit] if pairs else list(DEFAULT_CATEGORIES.keys())
 
 def fetch_ohlcv_multi(symbol, timeframe="1h", limit=100):
-    """Attempts to fetch candle data across multiple global exchanges."""
     for ex in get_active_exchanges():
         try:
             ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -50,16 +61,27 @@ def fetch_ohlcv_multi(symbol, timeframe="1h", limit=100):
     return pd.DataFrame()
 
 def build_packet(symbol, timeframe="1h", chain=None, pair=None):
-    """Builds an integrated analysis packet for a given symbol."""
     df_tf = fetch_ohlcv_multi(symbol, timeframe, 100)
     df_1d = fetch_ohlcv_multi(symbol, "1d", 100) if timeframe != "1d" else df_tf
     
-    htf_res = htf.analyze(df_tf, df_1d) if not df_tf.empty else {}
-    der_res = derivs.analyze(symbol)
+    htf_res = htf.analyze(df_tf, df_1d)
+    der_res = derivs.analyze(symbol) if hasattr(derivs, 'analyze') else {}
     chain_res = onchain.analyze(symbol, chain, pair) if hasattr(onchain, 'analyze') else {}
     
+    chg_24h, rel_vol = 0.0, 1.0
+    if not df_tf.empty and len(df_tf) >= 2:
+        chg_24h = float((df_tf['close'].iloc[-1] - df_tf['close'].iloc[0]) / df_tf['close'].iloc[0])
+        vol_mean = df_tf['volume'].mean()
+        if vol_mean > 0:
+            rel_vol = float(df_tf['volume'].iloc[-1] / vol_mean)
+
+    cat = DEFAULT_CATEGORIES.get(symbol, "General")
+
     packet = {
         "symbol": symbol,
+        "category": cat,
+        "chg_24h": chg_24h,
+        "rel_vol": rel_vol,
         "timeframe": timeframe,
         "timestamp": int(time.time()),
         "4h_atr_pct": htf_res.get("atr_pct", 0.05),
@@ -83,6 +105,5 @@ def log_signal(packet, verdict, path="signals.jsonl"):
         pass
 
 def universe(cats_file="categories.csv"):
-    if not os.path.exists(cats_file):
-        return pd.DataFrame()
+    ensure_categories_file(cats_file)
     return pd.read_csv(cats_file)
