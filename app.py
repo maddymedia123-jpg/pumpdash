@@ -11,22 +11,36 @@ import tracker
 
 st.set_page_config(layout="wide", page_title="Pump Desk")
 st.title("Pump Desk")
-st.caption("Automated Crypto Research & Scanning Desk")
+st.caption("Automated Crypto Research & Market Scanner Desk")
 
 CATS, EV = "categories.csv", "events.csv"
 
-# Load default watchlist from categories.csv if present
 if os.path.exists(CATS):
     _c = pd.read_csv(CATS)
     cat_of = dict(zip(_c.symbol, _c.category))
-    default_watch = "\n".join(_c.symbol.tolist())
 else:
     cat_of = {}
-    default_watch = "SOL/USDT\nTAO/USDT\nFET/USDT\nPEPE/USDT\nWIF/USDT\nSUI/USDT\nPENDLE/USDT"
 
 sb = st.sidebar
-watch = [s.strip() for s in sb.text_area("Watchlist (one per line)", default_watch, height=220).splitlines() if s.strip()]
-auto_run = sb.checkbox("Auto-scan on launch", value=True)
+sb.header("Scanner Configuration")
+
+scan_mode = sb.radio(
+    "Coins to Scan",
+    ["Auto-Discover Market (Top 50 Volume)", "Custom Watchlist"],
+    index=0
+)
+
+tf_map = {"1 Hour": "1h", "1 Day": "1d", "1 Week": "1w"}
+selected_tf_label = sb.selectbox("Scanning Timeframe", list(tf_map.keys()), index=0)
+selected_tf = tf_map[selected_tf_label]
+
+if scan_mode == "Custom Watchlist":
+    default_watch = "\n".join(_c.symbol.tolist()) if cat_of else "SOL/USDT\nTAO/USDT\nFET/USDT\nPEPE/USDT\nWIF/USDT"
+    watch = [s.strip() for s in sb.text_area("Watchlist (one per line)", default_watch, height=180).splitlines() if s.strip()]
+else:
+    watch = []
+
+auto_run = sb.checkbox("Auto-scan on launch", value=False)
 use_llm = sb.toggle("Run agent debate on top picks", value=bool(os.getenv("ANTHROPIC_API_KEY")))
 top_n = sb.slider("Top N sent to agents", 1, 5, 2)
 
@@ -60,18 +74,33 @@ def run_agents(pk):
 
 
 def execute_scan():
-    with st.spinner(f"Scanning {len(watch)} coins across multi-exchanges..."):
-        pks = scan.scan(watch, followers_now())
+    symbols_to_scan = watch
+    if scan_mode == "Auto-Discover Market (Top 50 Volume)":
+        with st.spinner("Fetching top 50 high-volume market pairs dynamically from global exchanges..."):
+            symbols_to_scan = data.fetch_top_market_pairs(limit=50)
+
+    st.info(f"Scanning {len(symbols_to_scan)} coins on {selected_tf_label} ({selected_tf}) timeframe...")
+    
+    with st.spinner("Analyzing market patterns & structure..."):
+        pks = scan.scan(symbols_to_scan, followers_now(), timeframe=selected_tf)
+
     for p in pks:
         if "error" in p:
             st.warning(f"{p['symbol']}: {p['error']}")
+
     ok = sorted((p for p in pks if "error" not in p), key=lambda p: p["scan_score"], reverse=True)
     cols = ["symbol", "scan_score", "htf_score", "htf_aligned", "htf_late", "deriv_regime", "deriv_funding",
             "chain_imbalance", "chain_wash_share", "dex_liq_usd"]
+
     if ok:
+        st.subheader(f"Top Potential Opportunities ({selected_tf_label})")
         st.dataframe(pd.DataFrame(ok).reindex(columns=cols), use_container_width=True)
+    else:
+        st.warning("No valid coins found during scan.")
+
     for p in ok:
         data.log_signal(p, {"verdict": "scan"})
+
     if use_llm:
         for p in [p for p in ok if p["scan_score"] > 0][:top_n]:
             rep, v = run_agents(p)
@@ -83,18 +112,20 @@ def execute_scan():
 t_scan, t_dive, t_rot, t_bt, t_trk = st.tabs(["Scan", "Deep dive", "Rotation", "Backtest", "Tracker"])
 
 with t_scan:
-    btn = st.button("Scan watchlist")
+    c1, c2 = st.columns([1, 4])
+    btn = c1.button("🔍 Run Scan Now", use_container_width=True)
     if btn or auto_run:
         execute_scan()
 
 with t_dive:
     sym = st.text_input("Symbol", "SOL/USDT")
+    dive_tf = st.selectbox("Deep Dive Timeframe", ["1h", "4h", "1d", "1w"], index=0)
     c1, c2 = st.columns(2)
     chain, pair = c1.text_input("DEX chain (optional)"), c2.text_input("Pool address (optional override)")
     lead = st.number_input("Current leader 24h gain % (for rotation TP)", 0.0, 500.0, 30.0) / 100
     if st.button("Analyze"):
         try:
-            pk = data.build_packet(sym, chain or None, pair or None)
+            pk = data.build_packet(sym, timeframe=dive_tf, chain=chain or None, pair=pair or None)
         except Exception as e:
             st.error(f"Could not build packet: {e}")
             st.stop()
@@ -113,7 +144,7 @@ with t_dive:
         ev = pd.read_csv(EV) if os.path.exists(EV) else pd.DataFrame()
         if len(ev) and cat_of.get(sym) in set(ev.category):
             ev = ev[ev.category == cat_of[sym]]
-        lv = rotation.tp_sl(ev.to_dict("records"), lead, pk["4h_atr_pct"])
+        lv = rotation.tp_sl(ev.to_dict("records") if len(ev) else [], lead, pk["4h_atr_pct"])
         st.subheader("TP / SL (% from entry)")
         st.json(lv)
         data.log_signal(pk, v)
