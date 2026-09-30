@@ -1,4 +1,4 @@
-  import requests
+import requests
 
 def stats(symbol, period="1h", n=24):
     s = symbol.replace("/", "").upper()
