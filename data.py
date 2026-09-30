@@ -65,7 +65,15 @@ def build_packet(symbol, timeframe="1h", chain=None, pair=None):
     df_1d = fetch_ohlcv_multi(symbol, "1d", 100) if timeframe != "1d" else df_tf
     
     htf_res = htf.analyze(df_tf, df_1d)
-    der_res = derivs.analyze(symbol) if hasattr(derivs, 'analyze') else {}
+    
+    # Properly connect to derivs.stats() with fallback checks
+    if hasattr(derivs, 'stats'):
+        der_res = derivs.stats(symbol, timeframe)
+    elif hasattr(derivs, 'analyze'):
+        der_res = derivs.analyze(symbol)
+    else:
+        der_res = {}
+        
     chain_res = onchain.analyze(symbol, chain, pair) if hasattr(onchain, 'analyze') else {}
     
     chg_24h, rel_vol = 0.0, 1.0
