@@ -66,7 +66,6 @@ def build_packet(symbol, timeframe="1h", chain=None, pair=None):
     
     htf_res = htf.analyze(df_tf, df_1d)
     
-    # Properly connect to derivs.stats() with fallback checks
     if hasattr(derivs, 'stats'):
         der_res = derivs.stats(symbol, timeframe)
     elif hasattr(derivs, 'analyze'):
